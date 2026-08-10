@@ -32,12 +32,14 @@ async function createTransaction(req,res){
     }
 
     const fromUserAccount = await accountModel.findOne({
-        _id:fromAccount
+        _id:fromAccount,
+        user: req.user._id
     })
 
     const toUserAccount = await accountModel.findOne({
         _id: toAccount
     })
+
 
     if(!fromUserAccount || !toUserAccount){
         return res.status(400).json({
@@ -100,48 +102,128 @@ async function createTransaction(req,res){
 
     //All four should be happend simuntaneously so thats why we use startTransaction and session
 
+    try{
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
+        const [transaction] = await transactionModel.create([{
+            fromAccount,
+            toAccount,
+            amount,
+            idempotencyKey,
+            status: "PENDING"
+        }], { session });
+
+        const debitLedgerEntry = await ledgerModel.create([{
+            account: fromAccount,
+            amount: amount,
+            transaction: transaction._id,
+            type: "DEBITED"
+        }], {session});
+
+        //Here we going to create a simulation in which some error occured and transaction takes time
+
+        await (() =>{
+            return new Promise((resolve) => setTimeout(resolve,15*1000))
+        })()
+
+
+        const creditLedgerEntry = await ledgerModel.create([{
+            account: toAccount,
+            amount: amount,
+            transaction: transaction._id,
+            type: "CREDITED"
+        }], {session});
+
+        transaction.status = "COMPLETED";
+        await transaction.save({session});
+
+        await session.commitTransaction();
+        session.endSession();
+
+        // 10)Send Email Notification
+
+        await emailService.sendTransactionEmail(req.user.email, req.user.name, amount, toAccount);
+
+        return res.status(201).json({
+            message: "Transaction completed successfully.",
+            transaction: transaction
+        })
+    }catch(err){
+        return res.status(400).json({
+            message: "Something went wrong , try again later."
+        })
+    }
+}
+
+async function createInitialFundsTransaction(req,res){
+
+    const {toAccount, idempotencyKey, amount} = req.body;
+
+    if(!toAccount || !idempotencyKey || !amount){
+        return res.status(400).json({
+            message: "Unauthorized, details are missing."
+        })
+    }
+
+    const toUserAccount = await accountModel.findById({
+        _id:toAccount
+    });
+
+    if(!toUserAccount){
+        return res.status(400).json({
+            message: "Invalid toAccount"
+        })
+    }
+
+    const fromUserAccount = await accountModel.findOne({
+        //systemUser: true,
+        user: req.user._id
+    })
+
+    if(!fromUserAccount){
+        return res.status(400).json({
+            message: "System user account not found."
+        })
+    }
+
     const session = await mongoose.startSession();
     session.startTransaction();
 
-    const transaction = await transactionModel.create({
-        fromAccount,
+    const [transaction] = await transactionModel.create([{
+        fromAccount: fromUserAccount._id,
         toAccount,
         amount,
         idempotencyKey,
         status: "PENDING"
-    }, { session });
+    }],{session});
 
-     const debitLedgerEntry = await ledgerModel.create({
-        account: fromAccount,
-        amount: amount,
+    const debitLedgerEntry = await ledgerModel.create([{
+        account: fromUserAccount._id,
+        amount,
         transaction: transaction._id,
         type: "DEBITED"
-    }, {session});
+    }],{session})
 
-
-    const creditLedgerEntry = await ledgerModel.create({
+    const creditLedgerEntry = await ledgerModel.create([{
         account: toAccount,
-        amount: amount,
+        amount,
         transaction: transaction._id,
         type: "CREDITED"
-    }, {session});
+    }],{session})
 
     transaction.status = "COMPLETED";
-    await transaction.save({session});
+    await transaction.save({ session });
 
     await session.commitTransaction();
     session.endSession();
 
-    // 10)Send Email Notification
-
-    await emailService.sendTransactionEmail(req.user.email, req.user.name, amount, toAccount);
-
     return res.status(201).json({
-        message: "Transaction completed successfully.",
+        message: "Intial funds transaction completed.",
         transaction: transaction
-    })
+    });
 }
 
 
 
-module.exports = {createTransaction};
+module.exports = {createTransaction , createInitialFundsTransaction};
